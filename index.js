@@ -140,7 +140,7 @@ async function placeSellOrder() {
 
 
 // ====== CRON JOB (every 5 min) ======
-cron.schedule("* * * * *", () => {
+cron.schedule("*/5 * * * *", () => {
   console.log("\n==============================");
   console.log(`🚀 New Cycle Started [${new Date().toLocaleTimeString()}]`);
   placeBuyOrder();
