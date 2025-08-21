@@ -1,5 +1,5 @@
 import { MongoClient, ServerApiVersion } from "mongodb";
-import WebSocket from "ws";
+import axios from "axios";
 import cron from "node-cron";
 import express from "express";
 import dotenv from "dotenv";
@@ -40,13 +40,20 @@ await connectDB();
 let latestPrice = null;
 let currentBuy = null;
 
-// ====== WebSocket to fetch ETH price ======
-const ws = new WebSocket("wss://stream.binance.com:9443/ws/ethusdt@trade");
+// ====== Replace WebSocket with REST API polling ======
+async function fetchPrice() {
+  try {
+    const res = await axios.get(
+      "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+    );
+    latestPrice = parseFloat(res.data.price);
+  } catch (err) {
+    console.error("❌ Price fetch failed:", err.message);
+  }
+}
 
-ws.on("message", (msg) => {
-  const data = JSON.parse(msg);
-  latestPrice = parseFloat(data.p); // price
-});
+// poll price every 5 sec
+setInterval(fetchPrice, 5000);
 
 // ====== Buy Order ======
 async function placeBuyOrder() {
@@ -62,7 +69,9 @@ async function placeBuyOrder() {
 
   currentBuy = buyOrder;
 
-  console.log(`🟢 BUY: 1 ETH at $${latestPrice} [${new Date().toLocaleTimeString()}]`);
+  console.log(
+    `🟢 BUY: 1 ETH at $${latestPrice} [${new Date().toLocaleTimeString()}]`
+  );
 
   // Schedule sell after 2 min
   setTimeout(placeSellOrder, 120 * 1000);
@@ -93,9 +102,17 @@ async function placeSellOrder() {
 
   // Console log with color
   if (pnlValue >= 0) {
-    console.log(`✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[32m+$${pnlValue.toFixed(2)}\x1b[0m`);
+    console.log(
+      `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[32m+$${pnlValue.toFixed(
+        2
+      )}\x1b[0m`
+    );
   } else {
-    console.log(`✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[31m$${pnlValue.toFixed(2)}\x1b[0m`);
+    console.log(
+      `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[31m$${pnlValue.toFixed(
+        2
+      )}\x1b[0m`
+    );
   }
 
   currentBuy = null;
