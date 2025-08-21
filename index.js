@@ -39,84 +39,105 @@ await connectDB();
 // ====== Global Vars ======
 let latestPrice = null;
 let currentBuy = null;
-
-// ====== Replace WebSocket with REST API polling ======
+// ====== Replace Binance with CoinGecko ======
 async function fetchPrice() {
   try {
     const res = await axios.get(
-      "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+      "https://api.coingecko.com/api/v3/simple/price",
+      {
+        params: {
+          ids: "ethereum",   // coin id
+          vs_currencies: "usd",
+        },
+      }
     );
-    latestPrice = parseFloat(res.data.price);
+
+    latestPrice = res.data.ethereum.usd;
+    console.log(latestPrice);
   } catch (err) {
     console.error("❌ Price fetch failed:", err.message);
   }
 }
 
-// poll price every 5 sec
-setInterval(fetchPrice, 5000);
-
 // ====== Buy Order ======
 async function placeBuyOrder() {
-  if (!latestPrice) return console.log("⏳ Waiting for price feed...");
+  try {
+    // Always fetch latest price before order
+    const price = await fetchPrice();
+    if (!price) return console.log("⏳ Waiting for price feed...");
 
-  const buyOrder = {
-    type: "buy",
-    price: latestPrice,
-    qty: 1,
-    time: new Date(),
-  };
-  await ordersCollection.insertOne(buyOrder);
+    const buyOrder = {
+      type: "buy",
+      price,
+      qty: 1,
+      time: new Date(),
+    };
 
-  currentBuy = buyOrder;
+    await ordersCollection.insertOne(buyOrder);
+    currentBuy = buyOrder;
 
-  console.log(
-    `🟢 BUY: 1 ETH at $${latestPrice} [${new Date().toLocaleTimeString()}]`
-  );
+    console.log(
+      `🟢 BUY: 1 ETH at $${price} [${new Date().toLocaleTimeString()}]`
+    );
 
-  // Schedule sell after 2 min
-  setTimeout(placeSellOrder, 120 * 1000);
+    // Schedule sell after 2 min
+    setTimeout(placeSellOrder, 120 * 1000);
+  } catch (err) {
+    console.error("❌ Buy order failed:", err.message);
+  }
 }
 
 // ====== Sell Order ======
 async function placeSellOrder() {
-  if (!currentBuy || !latestPrice) return;
+  try {
+    if (!currentBuy) return console.log("⚠️ No active buy to sell.");
 
-  const sellOrder = {
-    type: "sell",
-    price: latestPrice,
-    qty: 1,
-    time: new Date(),
-  };
-  await ordersCollection.insertOne(sellOrder);
+    // Always fetch latest price before selling
+    const price = await fetchPrice();
+    if (!price) return console.log("⏳ Waiting for price feed...");
 
-  // PNL calc
-  const pnlValue = (sellOrder.price - currentBuy.price) * currentBuy.qty;
+    const sellOrder = {
+      type: "sell",
+      price,
+      qty: 1,
+      time: new Date(),
+    };
 
-  const pnlEntry = {
-    buyPrice: currentBuy.price,
-    sellPrice: sellOrder.price,
-    profitLoss: pnlValue,
-    time: new Date(),
-  };
-  await pnlCollection.insertOne(pnlEntry);
+    await ordersCollection.insertOne(sellOrder);
 
-  // Console log with color
-  if (pnlValue >= 0) {
-    console.log(
-      `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[32m+$${pnlValue.toFixed(
-        2
-      )}\x1b[0m`
-    );
-  } else {
-    console.log(
-      `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[31m$${pnlValue.toFixed(
-        2
-      )}\x1b[0m`
-    );
+    // Calculate PNL
+    const pnlValue = (sellOrder.price - currentBuy.price) * currentBuy.qty;
+
+    const pnlEntry = {
+      buyPrice: currentBuy.price,
+      sellPrice: sellOrder.price,
+      profitLoss: pnlValue,
+      time: new Date(),
+    };
+
+    await pnlCollection.insertOne(pnlEntry);
+
+    // Console log with color
+    if (pnlValue >= 0) {
+      console.log(
+        `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[32m+$${pnlValue.toFixed(
+          2
+        )}\x1b[0m`
+      );
+    } else {
+      console.log(
+        `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[31m$${pnlValue.toFixed(
+          2
+        )}\x1b[0m`
+      );
+    }
+
+    currentBuy = null;
+  } catch (err) {
+    console.error("❌ Sell order failed:", err.message);
   }
-
-  currentBuy = null;
 }
+
 
 // ====== CRON JOB (every 5 min) ======
 cron.schedule("*/5 * * * *", () => {
