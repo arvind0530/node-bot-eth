@@ -53,7 +53,7 @@ async function fetchPrice() {
     );
 
     latestPrice = res.data.ethereum.usd;
-    console.log(latestPrice);
+    return latestPrice
   } catch (err) {
     console.error("❌ Price fetch failed:", err.message);
   }
@@ -140,7 +140,7 @@ async function placeSellOrder() {
 
 
 // ====== CRON JOB (every 5 min) ======
-cron.schedule("*/5 * * * *", () => {
+cron.schedule("* * * * *", () => {
   console.log("\n==============================");
   console.log(`🚀 New Cycle Started [${new Date().toLocaleTimeString()}]`);
   placeBuyOrder();
