@@ -3,6 +3,7 @@ import axios from "axios";
 import cron from "node-cron";
 import express from "express";
 import dotenv from "dotenv";
+import cors from "cors";
 
 dotenv.config();
 
@@ -149,7 +150,8 @@ cron.schedule("*/5 * * * *", () => {
 // ====== Express API ======
 const app = express();
 const PORT = process.env.PORT || 4000;
-
+// Allow all origins (for development)
+app.use(cors());
 // Get total PNL
 app.get("/api/pnl/total", async (req, res) => {
   try {
