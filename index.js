@@ -10,7 +10,7 @@ import axios from "axios";
 import WebSocket from "ws";
 import fs from "fs-extra";
 import { RSI, EMA } from "technicalindicators";
-
+import cors from "cors";
 dotenv.config();
 
 const {
@@ -24,6 +24,8 @@ const {
 } = process.env;
 
 const app = express();
+// Allow all origins (for development)
+app.use(cors());
 app.use(express.json());
 
 // ===== DB Setup =====
