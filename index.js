@@ -1,180 +1,211 @@
-import { MongoClient, ServerApiVersion } from "mongodb";
-import axios from "axios";
-import cron from "node-cron";
+/**
+ * Advanced EMA + RSI + Volume Bot with MongoDB Atlas (native driver)
+ * Author: Arvind's Setup
+ */
+
 import express from "express";
+import { MongoClient } from "mongodb";
 import dotenv from "dotenv";
-import cors from "cors";
+import axios from "axios";
+import WebSocket from "ws";
+import fs from "fs-extra";
+import { RSI, EMA } from "technicalindicators";
 
 dotenv.config();
 
-// ====== MongoDB Setup ======
-const uri =
-  process.env.MONGO_URI ||
-  "mongodb+srv://ArvindETH:Arvind2001@tracktohack.2rudkmv.mongodb.net/?retryWrites=true&w=majority&appName=TrackToHack";
+const {
+  MONGO_URI,
+  DB_NAME,
+  SYMBOL,
+  TIMEFRAME_MINUTES,
+  EMA_SMALL,
+  EMA_HIGH,
+  PORT,
+} = process.env;
 
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
+const app = express();
+app.use(express.json());
 
-let db, ordersCollection, pnlCollection;
+// ===== DB Setup =====
+let db, ordersCol, stateCol;
+const client = new MongoClient(MONGO_URI);
 
 async function connectDB() {
-  try {
-    await client.connect();
-    db = client.db("tradingBot"); // database name
-    ordersCollection = db.collection("orders");
-    pnlCollection = db.collection("pnl");
-
-    console.log("✅ Connected to MongoDB Atlas!");
-  } catch (err) {
-    console.error("❌ MongoDB connection failed:", err.message);
-    process.exit(1);
-  }
+  await client.connect();
+  db = client.db(DB_NAME);
+  ordersCol = db.collection("orders");
+  stateCol = db.collection("botState");
+  console.log("✅ Connected to MongoDB Atlas");
 }
 await connectDB();
 
-// ====== Global Vars ======
-let latestPrice = null;
-let currentBuy = null;
-// ====== Replace Binance with CoinGecko ======
-async function fetchPrice() {
-  try {
-    const res = await axios.get(
-      "https://api.coingecko.com/api/v3/simple/price",
-      {
-        params: {
-          ids: "ethereum",   // coin id
-          vs_currencies: "usd",
-        },
-      }
+// ===== Bot State =====
+let inPosition = false;
+let equity = 1000; // starting equity
+let currentTrade = null;
+let closes = [];
+let volumes = [];
+let rsiValues = [];
+let emaFast = [];
+let emaSlow = [];
+
+async function loadState() {
+  const state = await stateCol.findOne({ _id: "bot" });
+  if (state) {
+    inPosition = state.inPosition;
+    equity = state.equity;
+    currentTrade = state.currentTrade;
+    console.log("🔄 State restored from DB:", state);
+  }
+}
+async function saveState() {
+  await stateCol.updateOne(
+    { _id: "bot" },
+    { $set: { inPosition, equity, currentTrade } },
+    { upsert: true }
+  );
+}
+await loadState();
+
+// ===== Indicators =====
+function updateIndicators(close, volume) {
+  closes.push(close);
+  volumes.push(volume);
+
+  if (closes.length > EMA_HIGH) {
+    emaFast = EMA.calculate({ period: parseInt(EMA_SMALL), values: closes });
+    emaSlow = EMA.calculate({ period: parseInt(EMA_HIGH), values: closes });
+    rsiValues = RSI.calculate({ period: 14, values: closes });
+  }
+}
+
+function generateSignal() {
+  if (emaFast.length === 0 || emaSlow.length === 0 || rsiValues.length === 0)
+    return null;
+
+  const lastFast = emaFast[emaFast.length - 1];
+  const lastSlow = emaSlow[emaSlow.length - 1];
+  const rsi = rsiValues[rsiValues.length - 1];
+  const vol = volumes[volumes.length - 1];
+
+  // Buy signal
+  if (lastFast > lastSlow && rsi > 50 && vol > 0) return "BUY";
+  // Sell signal
+  if (lastFast < lastSlow && rsi < 50 && vol > 0) return "SELL";
+
+  return null;
+}
+
+// ===== Trading Logic =====
+async function placeTrade(signal, price, volume) {
+  const timestamp = new Date();
+
+  if (signal === "BUY" && !inPosition) {
+    inPosition = true;
+    currentTrade = {
+      side: "BUY",
+      entryPrice: price,
+      entryTime: timestamp,
+      volume,
+    };
+    await ordersCol.insertOne({ ...currentTrade, status: "OPEN" });
+    console.log(`🟢 BUY @ ${price}`);
+  }
+
+  if (signal === "SELL" && inPosition && currentTrade?.side === "BUY") {
+    inPosition = false;
+    const pnl = price - currentTrade.entryPrice;
+    equity += pnl;
+    const closed = {
+      ...currentTrade,
+      exitPrice: price,
+      exitTime: timestamp,
+      pnl,
+      status: "CLOSED",
+    };
+    await ordersCol.updateOne(
+      { _id: currentTrade._id },
+      { $set: closed },
+      { upsert: true }
     );
-
-    latestPrice = res.data.ethereum.usd;
-    return latestPrice
-  } catch (err) {
-    console.error("❌ Price fetch failed:", err.message);
+    currentTrade = null;
+    console.log(`🔴 SELL @ ${price} | PnL = ${pnl.toFixed(2)}`);
   }
+
+  await saveState();
 }
 
-// ====== Buy Order ======
-async function placeBuyOrder() {
-  try {
-    // Always fetch latest price before order
-    const price = await fetchPrice();
-    if (!price) return console.log("⏳ Waiting for price feed...");
+// ===== Binance WS =====
+const ws = new WebSocket(
+  `wss://stream.binance.com:9443/ws/${SYMBOL.toLowerCase()}@kline_${TIMEFRAME_MINUTES}`
+);
 
-    const buyOrder = {
-      type: "buy",
-      price,
-      qty: 1,
-      time: new Date(),
-    };
+ws.on("message", async (msg) => {
+  const data = JSON.parse(msg);
+  const k = data.k;
+  if (!k.x) return; // only closed candles
 
-    await ordersCollection.insertOne(buyOrder);
-    currentBuy = buyOrder;
+  const close = parseFloat(k.c);
+  const volume = parseFloat(k.v);
 
-    console.log(
-      `🟢 BUY: 1 ETH at $${price} [${new Date().toLocaleTimeString()}]`
-    );
+  updateIndicators(close, volume);
 
-    // Schedule sell after 2 min
-    setTimeout(placeSellOrder, 120 * 1000);
-  } catch (err) {
-    console.error("❌ Buy order failed:", err.message);
-  }
-}
-
-// ====== Sell Order ======
-async function placeSellOrder() {
-  try {
-    if (!currentBuy) return console.log("⚠️ No active buy to sell.");
-
-    // Always fetch latest price before selling
-    const price = await fetchPrice();
-    if (!price) return console.log("⏳ Waiting for price feed...");
-
-    const sellOrder = {
-      type: "sell",
-      price,
-      qty: 1,
-      time: new Date(),
-    };
-
-    await ordersCollection.insertOne(sellOrder);
-
-    // Calculate PNL
-    const pnlValue = (sellOrder.price - currentBuy.price) * currentBuy.qty;
-
-    const pnlEntry = {
-      buyPrice: currentBuy.price,
-      sellPrice: sellOrder.price,
-      profitLoss: pnlValue,
-      time: new Date(),
-    };
-
-    await pnlCollection.insertOne(pnlEntry);
-
-    // Console log with color
-    if (pnlValue >= 0) {
-      console.log(
-        `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[32m+$${pnlValue.toFixed(
-          2
-        )}\x1b[0m`
-      );
-    } else {
-      console.log(
-        `✅ SELL: 1 ETH at $${sellOrder.price} | PNL: \x1b[31m$${pnlValue.toFixed(
-          2
-        )}\x1b[0m`
-      );
-    }
-
-    currentBuy = null;
-  } catch (err) {
-    console.error("❌ Sell order failed:", err.message);
-  }
-}
-
-
-// ====== CRON JOB (every 5 min) ======
-cron.schedule("*/5 * * * *", () => {
-  console.log("\n==============================");
-  console.log(`🚀 New Cycle Started [${new Date().toLocaleTimeString()}]`);
-  placeBuyOrder();
-});
-
-// ====== Express API ======
-const app = express();
-const PORT = process.env.PORT || 4000;
-// Allow all origins (for development)
-app.use(cors());
-// Get total PNL
-app.get("/api/pnl/total", async (req, res) => {
-  try {
-    const result = await pnlCollection
-      .aggregate([{ $group: { _id: null, totalPnL: { $sum: "$profitLoss" } } }])
-      .toArray();
-
-    const total = result.length > 0 ? result[0].totalPnL : 0;
-    res.json({ totalPnL: total.toFixed(2) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  const signal = generateSignal();
+  if (signal) {
+    await placeTrade(signal, close, volume);
   }
 });
 
-// Get all PNL history
-app.get("/api/pnl/history", async (req, res) => {
-  try {
-    const history = await pnlCollection.find().sort({ time: -1 }).toArray();
-    res.json(history);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// ===== APIs =====
+app.get("/status", async (req, res) => {
+  res.json({ inPosition, equity, currentTrade });
 });
+
+app.get("/trades", async (req, res) => {
+  const trades = await ordersCol.find().toArray();
+  res.json(trades);
+});
+
+app.get("/pnl", async (req, res) => {
+  const trades = await ordersCol.find({ status: "CLOSED" }).toArray();
+  const totalPnL = trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+  res.json({
+    totalPnL,
+    totalTrades: trades.length,
+    winRate:
+      trades.length > 0
+        ? (
+            (trades.filter((t) => t.pnl > 0).length / trades.length) *
+            100
+          ).toFixed(2) + "%"
+        : "0%",
+  });
+});
+
+app.get("/pnl/daily", async (req, res) => {
+  const trades = await ordersCol.find({ status: "CLOSED" }).toArray();
+  const daily = {};
+  trades.forEach((t) => {
+    const day = new Date(t.exitTime).toISOString().split("T")[0];
+    daily[day] = (daily[day] || 0) + (t.pnl || 0);
+  });
+  res.json(daily);
+});
+
+app.delete("/trades", async (req, res) => {
+  await ordersCol.deleteMany({});
+  res.json({ message: "All trades cleared" });
+});
+
+app.delete("/state", async (req, res) => {
+  await stateCol.deleteOne({ _id: "bot" });
+  inPosition = false;
+  equity = 1000;
+  currentTrade = null;
+  res.json({ message: "Bot state reset" });
+});
+
+// ===== Start Server =====
 
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`✅ API server running on port ${PORT}`)
